@@ -1,0 +1,109 @@
+const mongoose = require("mongoose");
+
+// Shared so every schema serializes the same way: adds a string `id`
+// alongside `_id`, and strips internal fields the frontend doesn't need.
+function applyJsonTransform(schema) {
+  schema.set("toJSON", {
+    virtuals: true,
+    versionKey: false,
+    transform: (doc, ret) => {
+      delete ret.__v;
+      return ret;
+    },
+  });
+}
+
+const userSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
+    password: { type: String, required: true, select: false },
+    role: { type: String, enum: ["admin", "teacher"], default: "teacher" },
+  },
+  { timestamps: true },
+);
+applyJsonTransform(userSchema);
+
+const classSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    section: { type: String, trim: true },
+  },
+  { timestamps: true },
+);
+classSchema.index({ name: 1, section: 1 }, { unique: true });
+applyJsonTransform(classSchema);
+
+const studentSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    rollNumber: { type: String, required: true, trim: true },
+    classId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Class",
+      required: true,
+    },
+    photo: {
+      filename: { type: String, required: true },
+      mimeType: { type: String, required: true },
+    },
+    aadharCard: {
+      filename: { type: String, required: true },
+      mimeType: { type: String, required: true },
+    },
+  },
+  { timestamps: true },
+);
+studentSchema.index({ classId: 1, rollNumber: 1 }, { unique: true });
+
+// Convenience URLs so the frontend never has to hand-build these paths.
+studentSchema.virtual("photoUrl").get(function () {
+  return this.photo?.filename ? `/students/${this._id}/photo` : null;
+});
+studentSchema.virtual("aadharUrl").get(function () {
+  return this.aadharCard?.filename ? `/students/${this._id}/aadhar` : null;
+});
+
+applyJsonTransform(studentSchema);
+
+const attendanceSchema = new mongoose.Schema(
+  {
+    classId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Class",
+      required: true,
+    },
+    date: { type: Date, required: true },
+    records: [
+      {
+        studentId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Student",
+          required: true,
+        },
+        status: { type: String, enum: ["present", "absent"], required: true },
+      },
+    ],
+    takenBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+  },
+  { timestamps: true },
+);
+attendanceSchema.index({ classId: 1, date: 1 }, { unique: true });
+applyJsonTransform(attendanceSchema);
+
+module.exports = {
+  User: mongoose.model("User", userSchema),
+  Class: mongoose.model("Class", classSchema),
+  Student: mongoose.model("Student", studentSchema),
+  Attendance: mongoose.model("Attendance", attendanceSchema),
+};
