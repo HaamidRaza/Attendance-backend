@@ -5,6 +5,7 @@ const {
   uploadToCloudinary,
   deleteFromCloudinary,
   signedUrlFor,
+  streamAuthenticatedAsset,
 } = require("../utils/upload");
 const ATTENDANCE_EDIT_WINDOW_DAYS = 30;
 
@@ -315,7 +316,7 @@ async function deleteStudent(req, res, next) {
   }
 }
 
-async function studentPhoto(req, res, next, mimeType) {
+async function studentPhoto(req, res, next) {
   try {
     const s = await Student.findById(id(req.params.id));
     if (!s?.photo?.publicId) throw fail("Photo not found", 404);
@@ -324,7 +325,7 @@ async function studentPhoto(req, res, next, mimeType) {
       s.photo.resourceType,
       s.photo.mimeType,
     );
-    res.redirect(url);
+    await streamAuthenticatedAsset(url, res);
   } catch (e) {
     next(e);
   }
@@ -339,7 +340,7 @@ async function studentAadhar(req, res, next) {
       s.aadharCard.resourceType,
       s.aadharCard.mimeType,
     );
-    res.redirect(url);
+    await streamAuthenticatedAsset(url, res);
   } catch (e) {
     next(e);
   }

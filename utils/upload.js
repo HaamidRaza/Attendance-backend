@@ -1,6 +1,7 @@
 const multer = require("multer");
 const crypto = require("crypto");
 const cloudinary = require("cloudinary").v2;
+const https = require("https");
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -10,6 +11,34 @@ cloudinary.config({
 
 const ALLOWED_PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const ALLOWED_AADHAR_TYPES = ["image/jpeg", "image/png", "application/pdf"];
+
+// Fetches a signed Cloudinary URL server-side and pipes the bytes straight
+// through to the client. This avoids relying on Cloudinary returning CORS
+// headers on redirect — the browser only ever talks to our own backend.
+function streamAuthenticatedAsset(url, res) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (cloudinaryRes) => {
+        if (cloudinaryRes.statusCode !== 200) {
+          cloudinaryRes.resume(); // drain so the socket can close cleanly
+          reject(
+            Object.assign(new Error("Couldn't load file from storage"), {
+              status: cloudinaryRes.statusCode,
+            }),
+          );
+          return;
+        }
+        res.setHeader(
+          "Content-Type",
+          cloudinaryRes.headers["content-type"] || "application/octet-stream",
+        );
+        cloudinaryRes.pipe(res);
+        cloudinaryRes.on("end", resolve);
+        cloudinaryRes.on("error", reject);
+      })
+      .on("error", reject);
+  });
+}
 
 function extensionForMime(mimeType) {
   switch (mimeType) {
@@ -105,4 +134,5 @@ module.exports = {
   uploadToCloudinary,
   deleteFromCloudinary,
   signedUrlFor,
+  streamAuthenticatedAsset,
 };
