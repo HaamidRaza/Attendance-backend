@@ -50,11 +50,13 @@ const studentSchema = new mongoose.Schema(
       required: true,
     },
     photo: {
-      filename: { type: String, required: true },
+      publicId: { type: String, required: true },
+      resourceType: { type: String, default: "image" },
       mimeType: { type: String, required: true },
     },
     aadharCard: {
-      filename: { type: String, required: true },
+      publicId: { type: String, required: true },
+      resourceType: { type: String, default: "raw" },
       mimeType: { type: String, required: true },
     },
   },
@@ -62,12 +64,11 @@ const studentSchema = new mongoose.Schema(
 );
 studentSchema.index({ classId: 1, rollNumber: 1 }, { unique: true });
 
-// Convenience URLs so the frontend never has to hand-build these paths.
 studentSchema.virtual("photoUrl").get(function () {
-  return this.photo?.filename ? `/students/${this._id}/photo` : null;
+  return this.photo?.publicId ? `/students/${this._id}/photo` : null;
 });
 studentSchema.virtual("aadharUrl").get(function () {
-  return this.aadharCard?.filename ? `/students/${this._id}/aadhar` : null;
+  return this.aadharCard?.publicId ? `/students/${this._id}/aadhar` : null;
 });
 
 applyJsonTransform(studentSchema);

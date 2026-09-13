@@ -12,7 +12,9 @@ router.get("/auth/me", auth, c.me);
 
 // User management routes (admin only)
 router.get("/users", auth, requireAdmin, c.listUsers);
+router.get("/users/:id", auth, requireAdmin, c.oneUser);
 router.post("/users", auth, requireAdmin, c.createUser);
+router.put("/users/:id", auth, requireAdmin, c.updateUser);
 
 // Student routes
 router.get("/students", auth, c.listStudents);

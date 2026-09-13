@@ -1,9 +1,11 @@
-const path = require("path");
-const fs = require("fs");
 const bcrypt = require("bcryptjs");
 const { User, Student, Class, Attendance } = require("../models");
 const { tokenFor, safeUser } = require("../utils/auth");
-const { UPLOAD_DIR } = require("../utils/upload");
+const {
+  uploadToCloudinary,
+  deleteFromCloudinary,
+  signedUrlFor,
+} = require("../utils/upload");
 const ATTENDANCE_EDIT_WINDOW_DAYS = 30;
 
 const ok = (res, data, message = "Operation successful", code = 200) =>
@@ -71,6 +73,50 @@ async function me(req, res, next) {
   try {
     ok(res, safeUser(req.user));
   } catch (e) {
+    next(e);
+  }
+}
+
+async function oneUser(req, res, next) {
+  try {
+    const u = await User.findById(id(req.params.id));
+    if (!u) throw fail("User not found", 404);
+    ok(res, safeUser(u));
+  } catch (e) {
+    next(e);
+  }
+}
+
+async function updateUser(req, res, next) {
+  try {
+    const target = await User.findById(id(req.params.id));
+    if (!target) throw fail("User not found", 404);
+
+    const { name, email, password } = req.body || {};
+    if (!name?.trim() || !email?.trim())
+      throw fail("Name and email are required");
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const emailTaken = await User.exists({
+      email: normalizedEmail,
+      _id: { $ne: target._id },
+    });
+    if (emailTaken) throw fail("A user with this email already exists", 409);
+
+    target.name = name.trim();
+    target.email = normalizedEmail;
+
+    if (password) {
+      if (password.length < 6)
+        throw fail("Password must be at least 6 characters");
+      target.password = await bcrypt.hash(password, 10);
+    }
+
+    await target.save();
+    ok(res, safeUser(target), "User updated");
+  } catch (e) {
+    if (e.code === 11000)
+      return next(fail("A user with this email already exists", 409));
     next(e);
   }
 }
@@ -153,22 +199,38 @@ async function createStudent(req, res, next) {
     if (!(await Class.exists({ _id: classId })))
       throw fail("Class not found", 404);
 
+    const [photoResult, aadharResult] = await Promise.all([
+      uploadToCloudinary(
+        photoFile.buffer,
+        "students/photos",
+        "image",
+        photoFile.mimetype,
+      ),
+      uploadToCloudinary(
+        aadharFile.buffer,
+        "students/aadhar",
+        aadharFile.mimetype === "application/pdf" ? "raw" : "image",
+        aadharFile.mimetype,
+      ),
+    ]);
+
     const student = await Student.create({
       name,
       rollNumber,
       classId,
-      photo: { filename: photoFile.filename, mimeType: photoFile.mimetype },
+      photo: {
+        publicId: photoResult.public_id,
+        resourceType: "image",
+        mimeType: photoFile.mimetype,
+      },
       aadharCard: {
-        filename: aadharFile.filename,
+        publicId: aadharResult.public_id,
+        resourceType: aadharResult.resource_type,
         mimeType: aadharFile.mimetype,
       },
     });
     ok(res, student, "Student created", 201);
   } catch (e) {
-    // Clean up any files multer already wrote to disk if creation failed.
-    [req.files?.photo?.[0], req.files?.aadharCard?.[0]].forEach((f) => {
-      if (f) fs.unlink(f.path, () => {});
-    });
     next(e);
   }
 }
@@ -186,35 +248,55 @@ async function updateStudent(req, res, next) {
       rollNumber: req.body.rollNumber,
       classId: req.body.classId,
     };
-    if (photoFile)
+
+    if (photoFile) {
+      const result = await uploadToCloudinary(
+        photoFile.buffer,
+        "students/photos",
+        "image",
+        photoFile.mimetype,
+      );
       update.photo = {
-        filename: photoFile.filename,
+        publicId: result.public_id,
+        resourceType: "image",
         mimeType: photoFile.mimetype,
       };
-    if (aadharFile)
+    }
+    if (aadharFile) {
+      const resourceType =
+        aadharFile.mimetype === "application/pdf" ? "raw" : "image";
+      const result = await uploadToCloudinary(
+        aadharFile.buffer,
+        "students/aadhar",
+        resourceType,
+        aadharFile.mimetype,
+      );
       update.aadharCard = {
-        filename: aadharFile.filename,
+        publicId: result.public_id,
+        resourceType: result.resource_type,
         mimeType: aadharFile.mimetype,
       };
-
+    }
     const s = await Student.findByIdAndUpdate(existing._id, update, {
       new: true,
       runValidators: true,
     }).populate("classId", "name section");
 
-    // Only delete old files after the update has actually succeeded.
-    if (photoFile && existing.photo?.filename) {
-      fs.unlink(path.join(UPLOAD_DIR, existing.photo.filename), () => {});
+    if (photoFile && existing.photo?.publicId) {
+      await deleteFromCloudinary(
+        existing.photo.publicId,
+        existing.photo.resourceType,
+      );
     }
-    if (aadharFile && existing.aadharCard?.filename) {
-      fs.unlink(path.join(UPLOAD_DIR, existing.aadharCard.filename), () => {});
+    if (aadharFile && existing.aadharCard?.publicId) {
+      await deleteFromCloudinary(
+        existing.aadharCard.publicId,
+        existing.aadharCard.resourceType,
+      );
     }
 
     ok(res, s, "Student updated");
   } catch (e) {
-    [req.files?.photo?.[0], req.files?.aadharCard?.[0]].forEach((f) => {
-      if (f) fs.unlink(f.path, () => {});
-    });
     next(e);
   }
 }
@@ -223,20 +305,26 @@ async function deleteStudent(req, res, next) {
   try {
     const s = await Student.findByIdAndDelete(id(req.params.id));
     if (!s) throw fail("Student not found", 404);
-    [s.photo?.filename, s.aadharCard?.filename].forEach((f) => {
-      if (f) fs.unlink(path.join(UPLOAD_DIR, f), () => {});
-    });
+    await Promise.all([
+      deleteFromCloudinary(s.photo?.publicId, s.photo?.resourceType),
+      deleteFromCloudinary(s.aadharCard?.publicId, s.aadharCard?.resourceType),
+    ]);
     ok(res, null, "Student deleted");
   } catch (e) {
     next(e);
   }
 }
 
-async function studentPhoto(req, res, next) {
+async function studentPhoto(req, res, next, mimeType) {
   try {
     const s = await Student.findById(id(req.params.id));
-    if (!s?.photo?.filename) throw fail("Photo not found", 404);
-    res.sendFile(path.join(UPLOAD_DIR, s.photo.filename));
+    if (!s?.photo?.publicId) throw fail("Photo not found", 404);
+    const url = signedUrlFor(
+      s.photo.publicId,
+      s.photo.resourceType,
+      s.photo.mimeType,
+    );
+    res.redirect(url);
   } catch (e) {
     next(e);
   }
@@ -245,8 +333,13 @@ async function studentPhoto(req, res, next) {
 async function studentAadhar(req, res, next) {
   try {
     const s = await Student.findById(id(req.params.id));
-    if (!s?.aadharCard?.filename) throw fail("Aadhar document not found", 404);
-    res.sendFile(path.join(UPLOAD_DIR, s.aadharCard.filename));
+    if (!s?.aadharCard?.publicId) throw fail("Aadhar document not found", 404);
+    const url = signedUrlFor(
+      s.aadharCard.publicId,
+      s.aadharCard.resourceType,
+      s.aadharCard.mimeType,
+    );
+    res.redirect(url);
   } catch (e) {
     next(e);
   }
@@ -447,6 +540,8 @@ module.exports = {
   me,
   listUsers,
   createUser,
+  oneUser,
+  updateUser,
   listStudents,
   student,
   createStudent,

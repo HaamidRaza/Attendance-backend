@@ -1,24 +1,33 @@
 const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+const crypto = require("crypto");
+const cloudinary = require("cloudinary").v2;
 
-const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "students");
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, unique);
-  },
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
 const ALLOWED_PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"];
 const ALLOWED_AADHAR_TYPES = ["image/jpeg", "image/png", "application/pdf"];
 
+function extensionForMime(mimeType) {
+  switch (mimeType) {
+    case "application/pdf":
+      return "pdf";
+    case "image/png":
+      return "png";
+    case "image/webp":
+      return "webp";
+    case "image/jpeg":
+    default:
+      return "jpg";
+  }
+}
+
 function fileFilter(req, file, cb) {
-  const allowed = file.fieldname === "photo" ? ALLOWED_PHOTO_TYPES : ALLOWED_AADHAR_TYPES;
+  const allowed =
+    file.fieldname === "photo" ? ALLOWED_PHOTO_TYPES : ALLOWED_AADHAR_TYPES;
   if (!allowed.includes(file.mimetype)) {
     return cb(
       Object.assign(
@@ -35,7 +44,7 @@ function fileFilter(req, file, cb) {
 }
 
 const studentUpload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   fileFilter,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per file
 }).fields([
@@ -43,4 +52,57 @@ const studentUpload = multer({
   { name: "aadharCard", maxCount: 1 },
 ]);
 
-module.exports = { studentUpload, UPLOAD_DIR };
+function uploadToCloudinary(buffer, folder, resourceType, mimeType) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: resourceType,
+        type: "authenticated",
+        public_id: crypto.randomBytes(16).toString("hex"),
+        format: extensionForMime(mimeType), // tells Cloudinary exactly what this file is
+      },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result);
+      },
+    );
+    stream.end(buffer);
+  });
+}
+
+async function deleteFromCloudinary(publicId, resourceType) {
+  if (!publicId) return;
+  try {
+    await cloudinary.uploader.destroy(publicId, {
+      resource_type: resourceType,
+      type: "authenticated",
+    });
+  } catch (e) {
+    console.error("Failed to delete Cloudinary asset:", publicId, e.message);
+  }
+}
+
+function signedUrlFor(publicId, resourceType, mimeType) {
+  const expiresAt = Math.floor(Date.now() / 1000) + 5 * 60;
+  const options = {
+    resource_type: resourceType,
+    type: "authenticated",
+    sign_url: true,
+    secure: true,
+    expires_at: expiresAt,
+  };
+
+  if (resourceType !== "raw") {
+    options.format = extensionForMime(mimeType);
+  }
+
+  return cloudinary.url(publicId, options);
+}
+
+module.exports = {
+  studentUpload,
+  uploadToCloudinary,
+  deleteFromCloudinary,
+  signedUrlFor,
+};
