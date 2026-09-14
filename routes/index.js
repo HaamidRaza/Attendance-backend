@@ -15,12 +15,12 @@ router.get("/users", auth, requireAdmin, c.listUsers);
 router.get("/users/:id", auth, requireAdmin, c.oneUser);
 router.post("/users", auth, requireAdmin, c.createUser);
 router.put("/users/:id", auth, requireAdmin, c.updateUser);
+router.delete("/users/:id", auth, requireAdmin, c.deleteUser);
 
 // Student routes
 router.get("/students", auth, c.listStudents);
-router.get("/students/:id", auth, c.student);
-router.get("/students/:id/photo", auth, c.studentPhoto); // any authenticated user
-router.get("/students/:id/aadhar", auth, requireAdmin, c.studentAadhar); // admin only — sensitive doc
+router.get("/students/:id", auth, requireAdmin, c.student);
+router.get("/students/:id/photo", auth, c.studentPhoto);
 router.post("/students", auth, requireAdmin, studentUpload, c.createStudent);
 router.put("/students/:id", auth, requireAdmin, studentUpload, c.updateStudent);
 router.delete("/students/:id", auth, requireAdmin, c.deleteStudent);
@@ -31,10 +31,18 @@ router.get("/classes/:id", auth, c.oneClass);
 router.post("/classes", auth, requireAdmin, c.createClass);
 router.put("/classes/:id", auth, requireAdmin, c.updateClass);
 router.delete("/classes/:id", auth, requireAdmin, c.deleteClass);
+router.post("/classes/:id/teachers", auth, requireAdmin, c.assignTeacher);
+router.delete(
+  "/classes/:id/teachers/:teacherId",
+  auth,
+  requireAdmin,
+  c.unassignTeacher,
+);
 
 // Attendance routes — both admin and teacher can take and view attendance.
 router.get("/attendance", auth, c.listAttendance);
 router.get("/attendance/history", auth, c.listAttendance);
+router.get("/attendance/export", auth, c.exportMonthlyAttendance);
 router.get("/attendance/:id", auth, c.attendance);
 router.post("/attendance", auth, c.createAttendance);
 router.put("/attendance/:id", auth, c.updateAttendance);

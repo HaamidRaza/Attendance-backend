@@ -1,4 +1,5 @@
 const bcrypt = require("bcryptjs");
+const ExcelJS = require("exceljs");
 const { User, Student, Class, Attendance } = require("../models");
 const { tokenFor, safeUser } = require("../utils/auth");
 const {
@@ -7,12 +8,27 @@ const {
   signedUrlFor,
   streamAuthenticatedAsset,
 } = require("../utils/upload");
+
+const {
+  encrypt,
+  decrypt,
+  hashAadhar,
+  maskAadhar,
+} = require("../utils/encryption");
+
+const AADHAR_REGEX = /^\d{12}$/;
 const ATTENDANCE_EDIT_WINDOW_DAYS = 30;
 
 const ok = (res, data, message = "Operation successful", code = 200) =>
   res.status(code).json({ success: true, message, data });
 const fail = (message, code = 400) =>
   Object.assign(new Error(message), { status: code });
+
+async function assertClassAccess(user, classId) {
+  if (user.role === "admin") return;
+  const allowed = await Class.exists({ _id: classId, teachers: user._id });
+  if (!allowed) throw fail("You are not assigned to this class", 403);
+}
 
 const id = (v) => {
   if (!v || !/^[0-9a-f]{24}$/i.test(v)) throw fail("Invalid ID");
@@ -88,6 +104,33 @@ async function oneUser(req, res, next) {
   }
 }
 
+async function createUser(req, res, next) {
+  try {
+    const { name, email, password } = req.body || {};
+    if (!name || !email || !password)
+      throw fail("Name, email, and password are required");
+    if (password.length < 6)
+      throw fail("Password must be at least 6 characters");
+
+    const normalizedEmail = email.toLowerCase().trim();
+    if (await User.exists({ email: normalizedEmail }))
+      throw fail("A user with this email already exists", 409);
+
+    const hashed = await bcrypt.hash(password, 10);
+    const user = await User.create({
+      name,
+      email: normalizedEmail,
+      password: hashed,
+      role: "teacher", // admins can only create teacher accounts via this endpoint
+    });
+    ok(res, safeUser(user), "Teacher account created", 201);
+  } catch (e) {
+    if (e.code === 11000)
+      return next(fail("A user with this email already exists", 409));
+    next(e);
+  }
+}
+
 async function updateUser(req, res, next) {
   try {
     const target = await User.findById(id(req.params.id));
@@ -122,6 +165,37 @@ async function updateUser(req, res, next) {
   }
 }
 
+async function deleteUser(req, res, next) {
+  try {
+    const targetId = id(req.params.id);
+
+    if (String(req.user._id) === targetId)
+      throw fail("You can't delete your own account", 400);
+
+    const target = await User.findById(targetId);
+    if (!target) throw fail("User not found", 404);
+
+    if (target.role === "admin") {
+      const adminCount = await User.countDocuments({ role: "admin" });
+      if (adminCount <= 1)
+        throw fail("Cannot delete the last remaining admin account", 400);
+    }
+
+    await User.findByIdAndDelete(targetId);
+
+    // Clean up any class assignments referencing this user, so `teachers`
+    // arrays never hold a dangling reference to a deleted account.
+    await Class.updateMany(
+      { teachers: targetId },
+      { $pull: { teachers: targetId } },
+    );
+
+    ok(res, null, "User deleted");
+  } catch (e) {
+    next(e);
+  }
+}
+
 async function listUsers(req, res, next) {
   try {
     ok(res, await User.find().sort({ createdAt: -1 }));
@@ -130,37 +204,18 @@ async function listUsers(req, res, next) {
   }
 }
 
-async function createUser(req, res, next) {
-  try {
-    const { name, email, password } = req.body || {};
-    if (!name || !email || !password)
-      throw fail("Name, email, and password are required");
-    if (password.length < 6)
-      throw fail("Password must be at least 6 characters");
-
-    const normalizedEmail = email.toLowerCase().trim();
-    if (await User.exists({ email: normalizedEmail }))
-      throw fail("A user with this email already exists", 409);
-
-    const hashed = await bcrypt.hash(password, 10);
-    const user = await User.create({
-      name,
-      email: normalizedEmail,
-      password: hashed,
-      role: "teacher", // admins can only create teacher accounts via this endpoint
-    });
-    ok(res, safeUser(user), "Teacher account created", 201);
-  } catch (e) {
-    if (e.code === 11000)
-      return next(fail("A user with this email already exists", 409));
-    next(e);
-  }
-}
-
 async function listStudents(req, res, next) {
   try {
     const q = {};
-    if (req.query.classId) q.classId = id(req.query.classId);
+    if (req.query.classId) {
+      q.classId = id(req.query.classId);
+      await assertClassAccess(req.user, q.classId);
+    } else if (req.user.role === "teacher") {
+      const classes = await Class.find({ teachers: req.user._id }).select(
+        "_id",
+      );
+      q.classId = { $in: classes.map((c) => c._id) };
+    }
     if (req.query.search)
       q.$or = [
         { name: new RegExp(req.query.search, "i") },
@@ -179,7 +234,16 @@ async function student(req, res, next) {
       "name section",
     );
     if (!s) throw fail("Student not found", 404);
-    ok(res, s);
+    // Details page is admin-only, so it's the one place the full,
+    // decrypted number is returned.
+    const obj = s.toJSON();
+    delete obj.aadharHash;
+    try {
+      obj.aadharNumber = decrypt(s.aadharNumber);
+    } catch {
+      obj.aadharNumber = null;
+    }
+    ok(res, obj);
   } catch (e) {
     next(e);
   }
@@ -187,35 +251,31 @@ async function student(req, res, next) {
 
 async function createStudent(req, res, next) {
   try {
-    const { name, rollNumber, classId } = req.body || {};
+    const { name, rollNumber, classId, aadharNumber } = req.body || {};
     const photoFile = req.files?.photo?.[0];
-    const aadharFile = req.files?.aadharCard?.[0];
 
     if (!name || !rollNumber || !classId)
       throw fail("Name, roll number, and class ID are required");
     if (!photoFile) throw fail("Student photo is required");
-    if (!aadharFile) throw fail("Aadhar card (photo or PDF) is required");
+    if (!AADHAR_REGEX.test(aadharNumber || ""))
+      throw fail("Aadhar number must be exactly 12 digits");
 
     id(classId);
     if (!(await Class.exists({ _id: classId })))
       throw fail("Class not found", 404);
 
-    const [photoResult, aadharResult] = await Promise.all([
-      uploadToCloudinary(
-        photoFile.buffer,
-        "students/photos",
-        "image",
-        photoFile.mimetype,
-      ),
-      uploadToCloudinary(
-        aadharFile.buffer,
-        "students/aadhar",
-        aadharFile.mimetype === "application/pdf" ? "raw" : "image",
-        aadharFile.mimetype,
-      ),
-    ]);
+    const aadharHash = hashAadhar(aadharNumber);
+    if (await Student.exists({ aadharHash }))
+      throw fail("A student with this Aadhar number already exists", 409);
 
-    const student = await Student.create({
+    const photoResult = await uploadToCloudinary(
+      photoFile.buffer,
+      "students/photos",
+      "image",
+      photoFile.mimetype,
+    );
+
+    const s = await Student.create({
       name,
       rollNumber,
       classId,
@@ -224,14 +284,19 @@ async function createStudent(req, res, next) {
         resourceType: "image",
         mimeType: photoFile.mimetype,
       },
-      aadharCard: {
-        publicId: aadharResult.public_id,
-        resourceType: aadharResult.resource_type,
-        mimeType: aadharFile.mimetype,
-      },
+      aadharNumber: encrypt(aadharNumber),
+      aadharHash,
     });
-    ok(res, student, "Student created", 201);
+
+    const obj = s.toJSON();
+    delete obj.aadharHash;
+    obj.aadharNumber = aadharNumber; // echo back what was just entered, no need to re-decrypt
+    ok(res, obj, "Student created", 201);
   } catch (e) {
+    if (e.code === 11000)
+      return next(
+        fail("A student with this Aadhar number already exists", 409),
+      );
     next(e);
   }
 }
@@ -242,13 +307,23 @@ async function updateStudent(req, res, next) {
     if (!existing) throw fail("Student not found", 404);
 
     const photoFile = req.files?.photo?.[0];
-    const aadharFile = req.files?.aadharCard?.[0];
+    const { name, rollNumber, classId, aadharNumber } = req.body || {};
 
-    const update = {
-      name: req.body.name,
-      rollNumber: req.body.rollNumber,
-      classId: req.body.classId,
-    };
+    const update = { name, rollNumber, classId };
+
+    if (aadharNumber) {
+      if (!AADHAR_REGEX.test(aadharNumber))
+        throw fail("Aadhar number must be exactly 12 digits");
+      const aadharHash = hashAadhar(aadharNumber);
+      const clash = await Student.exists({
+        aadharHash,
+        _id: { $ne: existing._id },
+      });
+      if (clash)
+        throw fail("A student with this Aadhar number already exists", 409);
+      update.aadharNumber = encrypt(aadharNumber);
+      update.aadharHash = aadharHash;
+    }
 
     if (photoFile) {
       const result = await uploadToCloudinary(
@@ -263,21 +338,7 @@ async function updateStudent(req, res, next) {
         mimeType: photoFile.mimetype,
       };
     }
-    if (aadharFile) {
-      const resourceType =
-        aadharFile.mimetype === "application/pdf" ? "raw" : "image";
-      const result = await uploadToCloudinary(
-        aadharFile.buffer,
-        "students/aadhar",
-        resourceType,
-        aadharFile.mimetype,
-      );
-      update.aadharCard = {
-        publicId: result.public_id,
-        resourceType: result.resource_type,
-        mimeType: aadharFile.mimetype,
-      };
-    }
+
     const s = await Student.findByIdAndUpdate(existing._id, update, {
       new: true,
       runValidators: true,
@@ -289,15 +350,20 @@ async function updateStudent(req, res, next) {
         existing.photo.resourceType,
       );
     }
-    if (aadharFile && existing.aadharCard?.publicId) {
-      await deleteFromCloudinary(
-        existing.aadharCard.publicId,
-        existing.aadharCard.resourceType,
-      );
-    }
 
-    ok(res, s, "Student updated");
+    const obj = s.toJSON();
+    delete obj.aadharHash;
+    try {
+      obj.aadharNumber = decrypt(s.aadharNumber);
+    } catch {
+      obj.aadharNumber = null;
+    }
+    ok(res, obj, "Student updated");
   } catch (e) {
+    if (e.code === 11000)
+      return next(
+        fail("A student with this Aadhar number already exists", 409),
+      );
     next(e);
   }
 }
@@ -306,10 +372,7 @@ async function deleteStudent(req, res, next) {
   try {
     const s = await Student.findByIdAndDelete(id(req.params.id));
     if (!s) throw fail("Student not found", 404);
-    await Promise.all([
-      deleteFromCloudinary(s.photo?.publicId, s.photo?.resourceType),
-      deleteFromCloudinary(s.aadharCard?.publicId, s.aadharCard?.resourceType),
-    ]);
+    await deleteFromCloudinary(s.photo?.publicId, s.photo?.resourceType);
     ok(res, null, "Student deleted");
   } catch (e) {
     next(e);
@@ -331,30 +394,28 @@ async function studentPhoto(req, res, next) {
   }
 }
 
-async function studentAadhar(req, res, next) {
-  try {
-    const s = await Student.findById(id(req.params.id));
-    if (!s?.aadharCard?.publicId) throw fail("Aadhar document not found", 404);
-    const url = signedUrlFor(
-      s.aadharCard.publicId,
-      s.aadharCard.resourceType,
-      s.aadharCard.mimeType,
-    );
-    await streamAuthenticatedAsset(url, res);
-  } catch (e) {
-    next(e);
-  }
-}
-
 async function listClasses(req, res, next) {
   try {
+    const match = {};
+    if (req.user.role === "teacher") {
+      match.teachers = req.user._id;
+    }
     const data = await Class.aggregate([
+      { $match: match },
       {
         $lookup: {
           from: "students",
           localField: "_id",
           foreignField: "classId",
           as: "students",
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "teachers",
+          foreignField: "_id",
+          as: "teacherDetails",
         },
       },
       {
@@ -365,6 +426,17 @@ async function listClasses(req, res, next) {
           createdAt: 1,
           updatedAt: 1,
           studentCount: { $size: "$students" },
+          teachers: {
+            $map: {
+              input: "$teacherDetails",
+              as: "t",
+              in: {
+                id: { $toString: "$$t._id" },
+                name: "$$t.name",
+                email: "$$t.email",
+              },
+            },
+          },
         },
       },
     ]);
@@ -376,8 +448,12 @@ async function listClasses(req, res, next) {
 
 async function oneClass(req, res, next) {
   try {
-    const c = await Class.findById(id(req.params.id));
+    const c = await Class.findById(id(req.params.id)).populate(
+      "teachers",
+      "name email",
+    );
     if (!c) throw fail("Class not found", 404);
+    await assertClassAccess(req.user, c._id);
     ok(res, {
       ...c.toJSON(),
       studentCount: await Student.countDocuments({ classId: c._id }),
@@ -441,9 +517,18 @@ async function validateRecords(classId, records) {
 async function listAttendance(req, res, next) {
   try {
     const q = {};
-    if (req.query.classId) q.classId = id(req.query.classId);
+    if (req.query.classId) {
+      q.classId = id(req.query.classId);
+      await assertClassAccess(req.user, q.classId);
+    } else if (req.user.role === "teacher") {
+      const classes = await Class.find({ teachers: req.user._id }).select(
+        "_id",
+      );
+      q.classId = { $in: classes.map((c) => c._id) };
+    }
     if (req.query.date) q.date = day(req.query.date);
     const rows = await Attendance.find(q)
+      .sort({ updatedAt: -1 })
       .populate("classId", "name section")
       .populate("takenBy", "name email");
     ok(
@@ -462,6 +547,7 @@ async function attendance(req, res, next) {
       .populate("records.studentId", "name rollNumber")
       .populate("takenBy", "name email");
     if (!a) throw fail("Attendance not found", 404);
+    await assertClassAccess(req.user, a.classId._id);
     ok(res, { ...a.toJSON(), statistics: stats(a.records) });
   } catch (e) {
     next(e);
@@ -471,6 +557,7 @@ async function attendance(req, res, next) {
 async function createAttendance(req, res, next) {
   try {
     const { classId, date, records } = req.body || {};
+    await assertClassAccess(req.user, classId);
     await validateRecords(classId, records);
     ok(
       res,
@@ -479,6 +566,8 @@ async function createAttendance(req, res, next) {
         date: day(date),
         records,
         takenBy: req.user._id,
+        takenByName: req.user.name,
+        takenByEmail: req.user.email,
       }),
       "Attendance created",
       201,
@@ -496,10 +585,13 @@ async function updateAttendance(req, res, next) {
   try {
     const a = await Attendance.findById(id(req.params.id));
     if (!a) throw fail("Attendance not found", 404);
+    await assertClassAccess(req.user, a.classId);
     await validateRecords(a.classId, req.body.records);
     a.records = req.body.records;
     if (req.body.date) a.date = day(req.body.date);
-    a.takenBy = req.user._id; // record now reflects whoever last saved it
+    a.takenBy = req.user._id;
+    a.takenByName = req.user.name;
+    a.takenByEmail = req.user.email;
     await a.save();
     ok(res, a, "Attendance updated");
   } catch (e) {
@@ -512,6 +604,49 @@ async function deleteAttendance(req, res, next) {
     const a = await Attendance.findByIdAndDelete(id(req.params.id));
     if (!a) throw fail("Attendance not found", 404);
     ok(res, null, "Attendance deleted");
+  } catch (e) {
+    next(e);
+  }
+}
+
+async function assignTeacher(req, res, next) {
+  try {
+    const classId = id(req.params.id);
+    const { teacherId } = req.body || {};
+    id(teacherId);
+
+    const [cls, teacher] = await Promise.all([
+      Class.findById(classId),
+      User.findById(teacherId),
+    ]);
+    if (!cls) throw fail("Class not found", 404);
+    if (!teacher || teacher.role !== "teacher")
+      throw fail("Teacher not found", 404);
+
+    if (cls.teachers.some((t) => t.equals(teacher._id)))
+      throw fail("This teacher is already assigned to this class", 409);
+
+    cls.teachers.push(teacher._id);
+    await cls.save();
+    await cls.populate("teachers", "name email");
+    ok(res, cls, "Teacher assigned");
+  } catch (e) {
+    next(e);
+  }
+}
+
+async function unassignTeacher(req, res, next) {
+  try {
+    const classId = id(req.params.id);
+    const teacherId = id(req.params.teacherId);
+
+    const cls = await Class.findById(classId);
+    if (!cls) throw fail("Class not found", 404);
+
+    cls.teachers = cls.teachers.filter((t) => !t.equals(teacherId));
+    await cls.save();
+    await cls.populate("teachers", "name email");
+    ok(res, cls, "Teacher unassigned");
   } catch (e) {
     next(e);
   }
@@ -536,6 +671,122 @@ async function dashboard(req, res, next) {
   }
 }
 
+async function exportMonthlyAttendance(req, res, next) {
+  try {
+    const classId = id(req.query.classId);
+    await assertClassAccess(req.user, classId);
+
+    const monthStr = req.query.month; // expected "YYYY-MM"
+    if (!/^\d{4}-\d{2}$/.test(monthStr || ""))
+      throw fail("A valid month (YYYY-MM) is required");
+
+    const [year, monthNum] = monthStr.split("-").map(Number);
+    const startDate = new Date(Date.UTC(year, monthNum - 1, 1));
+    const lastDayOfMonth = new Date(Date.UTC(year, monthNum, 0));
+
+    const today = new Date();
+    const todayUTC = new Date(
+      Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()),
+    );
+    if (startDate.getTime() > todayUTC.getTime())
+      throw fail("Cannot export a future month");
+
+    // Don't include days beyond today if this is the current month.
+    const endDate =
+      lastDayOfMonth.getTime() > todayUTC.getTime() ? todayUTC : lastDayOfMonth;
+
+    const [cls, students, records] = await Promise.all([
+      Class.findById(classId),
+      Student.find({ classId }),
+      Attendance.find({ classId, date: { $gte: startDate, $lte: endDate } }),
+    ]);
+    if (!cls) throw fail("Class not found", 404);
+
+    students.sort((a, b) => {
+      const numA = parseInt(a.rollNumber, 10);
+      const numB = parseInt(b.rollNumber, 10);
+      // Falls back to a plain string comparison if a roll number isn't
+      // purely numeric (e.g. "7A"), so the sort never silently breaks.
+      if (!Number.isNaN(numA) && !Number.isNaN(numB) && numA !== numB)
+        return numA - numB;
+      return a.rollNumber.localeCompare(b.rollNumber);
+    });
+
+    const dates = [];
+    for (
+      let d = new Date(startDate);
+      d.getTime() <= endDate.getTime();
+      d.setUTCDate(d.getUTCDate() + 1)
+    ) {
+      dates.push(new Date(d));
+    }
+
+    // dateKey -> (studentId -> status), for fast lookup per row/column.
+    const byDate = new Map();
+    records.forEach((r) => {
+      const key = r.date.toISOString().slice(0, 10);
+      const statusMap = new Map();
+      r.records.forEach((rec) =>
+        statusMap.set(String(rec.studentId), rec.status),
+      );
+      byDate.set(key, statusMap);
+    });
+
+    const monthLabel = startDate.toLocaleDateString("en-US", {
+      month: "long",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+    const className = cls.section ? `${cls.name} - ${cls.section}` : cls.name;
+
+    const workbook = new ExcelJS.Workbook();
+    const safeSheetName = `${className} ${monthLabel}`
+      .replace(/[*?:\\/\[\]]/g, "-") // strip characters Excel forbids in sheet names
+      .slice(0, 31);
+    const sheet = workbook.addWorksheet(safeSheetName);
+
+    const dateHeaders = dates.map((d) =>
+      d.toLocaleDateString("en-GB", {
+        day: "2-digit",
+        month: "short",
+        timeZone: "UTC",
+      }),
+    );
+    sheet.addRow(["Roll No.", "Student Name", ...dateHeaders]);
+    sheet.getRow(1).font = { bold: true };
+    sheet.getRow(1).alignment = { horizontal: "center" };
+    sheet.views = [{ state: "frozen", xSplit: 2, ySplit: 1 }];
+
+    students.forEach((s) => {
+      const row = [s.rollNumber, s.name];
+      dates.forEach((d) => {
+        const key = d.toISOString().slice(0, 10);
+        const status = byDate.get(key)?.get(String(s._id));
+        row.push(status ? (status === "present" ? "Present" : "Absent") : "");
+      });
+      sheet.addRow(row);
+    });
+
+    sheet.columns.forEach((col, i) => {
+      col.width = i === 0 ? 12 : i === 1 ? 22 : 11;
+      if (i >= 2) col.alignment = { horizontal: "center" };
+    });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${className.replace(/[^\w-]/g, "_")}-${monthStr}.xlsx"`,
+    );
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (e) {
+    next(e);
+  }
+}
+
 module.exports = {
   login,
   me,
@@ -543,22 +794,25 @@ module.exports = {
   createUser,
   oneUser,
   updateUser,
+  deleteUser,
   listStudents,
   student,
   createStudent,
   updateStudent,
   deleteStudent,
   studentPhoto,
-  studentAadhar,
   listClasses,
   oneClass,
   createClass,
   updateClass,
   deleteClass,
+  assignTeacher,
+  unassignTeacher,
   listAttendance,
   attendance,
   createAttendance,
   updateAttendance,
   deleteAttendance,
+  exportMonthlyAttendance,
   dashboard,
 };

@@ -34,6 +34,7 @@ const classSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     section: { type: String, trim: true },
+    teachers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
   },
   { timestamps: true },
 );
@@ -54,11 +55,8 @@ const studentSchema = new mongoose.Schema(
       resourceType: { type: String, default: "image" },
       mimeType: { type: String, required: true },
     },
-    aadharCard: {
-      publicId: { type: String, required: true },
-      resourceType: { type: String, default: "raw" },
-      mimeType: { type: String, required: true },
-    },
+    aadharNumber: { type: String, required: true }, // encrypted payload (iv:tag:ciphertext)
+    aadharHash: { type: String, required: true, unique: true }, // deterministic hash, for duplicate detection only
   },
   { timestamps: true },
 );
@@ -66,9 +64,6 @@ studentSchema.index({ classId: 1, rollNumber: 1 }, { unique: true });
 
 studentSchema.virtual("photoUrl").get(function () {
   return this.photo?.publicId ? `/students/${this._id}/photo` : null;
-});
-studentSchema.virtual("aadharUrl").get(function () {
-  return this.aadharCard?.publicId ? `/students/${this._id}/aadhar` : null;
 });
 
 applyJsonTransform(studentSchema);
@@ -96,6 +91,8 @@ const attendanceSchema = new mongoose.Schema(
       ref: "User",
       required: true,
     },
+    takenByName: { type: String, required: true },
+    takenByEmail: { type: String, required: true },
   },
   { timestamps: true },
 );

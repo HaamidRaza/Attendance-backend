@@ -10,7 +10,6 @@ cloudinary.config({
 });
 
 const ALLOWED_PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"];
-const ALLOWED_AADHAR_TYPES = ["image/jpeg", "image/png", "application/pdf"];
 
 // Fetches a signed Cloudinary URL server-side and pipes the bytes straight
 // through to the client. This avoids relying on Cloudinary returning CORS
@@ -55,18 +54,11 @@ function extensionForMime(mimeType) {
 }
 
 function fileFilter(req, file, cb) {
-  const allowed =
-    file.fieldname === "photo" ? ALLOWED_PHOTO_TYPES : ALLOWED_AADHAR_TYPES;
-  if (!allowed.includes(file.mimetype)) {
+  if (!ALLOWED_PHOTO_TYPES.includes(file.mimetype)) {
     return cb(
-      Object.assign(
-        new Error(
-          file.fieldname === "photo"
-            ? "Photo must be a JPEG, PNG, or WebP image"
-            : "Aadhar document must be a JPEG/PNG image or a PDF",
-        ),
-        { status: 400 },
-      ),
+      Object.assign(new Error("Photo must be a JPEG, PNG, or WebP image"), {
+        status: 400,
+      }),
     );
   }
   cb(null, true);
@@ -75,11 +67,8 @@ function fileFilter(req, file, cb) {
 const studentUpload = multer({
   storage: multer.memoryStorage(),
   fileFilter,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per file
-}).fields([
-  { name: "photo", maxCount: 1 },
-  { name: "aadharCard", maxCount: 1 },
-]);
+  limits: { fileSize: 10 * 1024 * 1024 },
+}).fields([{ name: "photo", maxCount: 1 }]);
 
 function uploadToCloudinary(buffer, folder, resourceType, mimeType) {
   return new Promise((resolve, reject) => {
