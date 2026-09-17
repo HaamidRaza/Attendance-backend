@@ -57,6 +57,11 @@ const studentSchema = new mongoose.Schema(
     },
     aadharNumber: { type: String, required: true }, // encrypted payload (iv:tag:ciphertext)
     aadharHash: { type: String, required: true, unique: true }, // deterministic hash, for duplicate detection only
+    monthlyFee: { type: Number, required: true, default: 0, min: 0 },
+    parentPhone: { type: String, trim: true },
+    // Billing starts from this month (YYYY-MM). Defaults to the month the
+    // student was added, but the admin can backdate it at creation.
+    feesStartMonth: { type: String, required: true },
   },
   { timestamps: true },
 );
@@ -67,6 +72,23 @@ studentSchema.virtual("photoUrl").get(function () {
 });
 
 applyJsonTransform(studentSchema);
+
+const feeMonthSchema = new mongoose.Schema(
+  {
+    studentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Student",
+      required: true,
+      index: true,
+    },
+    month: { type: String, required: true }, // "YYYY-MM"
+    paid: { type: Boolean, default: false },
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  },
+  { timestamps: true },
+);
+feeMonthSchema.index({ studentId: 1, month: 1 }, { unique: true });
+applyJsonTransform(feeMonthSchema);
 
 const attendanceSchema = new mongoose.Schema(
   {
@@ -104,4 +126,5 @@ module.exports = {
   Class: mongoose.model("Class", classSchema),
   Student: mongoose.model("Student", studentSchema),
   Attendance: mongoose.model("Attendance", attendanceSchema),
+  FeeMonth: mongoose.model("FeeMonth", feeMonthSchema),
 };

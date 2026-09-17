@@ -24,6 +24,9 @@ router.get("/students/:id/photo", auth, c.studentPhoto);
 router.post("/students", auth, requireAdmin, studentUpload, c.createStudent);
 router.put("/students/:id", auth, requireAdmin, studentUpload, c.updateStudent);
 router.delete("/students/:id", auth, requireAdmin, c.deleteStudent);
+router.get("/students/:id/fees", auth, requireAdmin, c.studentFees);
+router.get("/students/:id/fees", auth, requireAdmin, c.studentFees);
+router.put("/students/:id/fees/:month", auth, requireAdmin, c.setFeeMonth);
 
 // Class routes — same pattern as students.
 router.get("/classes", auth, c.listClasses);

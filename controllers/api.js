@@ -1,6 +1,6 @@
 const bcrypt = require("bcryptjs");
 const ExcelJS = require("exceljs");
-const { User, Student, Class, Attendance } = require("../models");
+const { User, Student, Class, Attendance, FeeMonth } = require("../models");
 const { tokenFor, safeUser } = require("../utils/auth");
 const {
   uploadToCloudinary,
@@ -9,14 +9,10 @@ const {
   streamAuthenticatedAsset,
 } = require("../utils/upload");
 
-const {
-  encrypt,
-  decrypt,
-  hashAadhar,
-  maskAadhar,
-} = require("../utils/encryption");
+const { encrypt, decrypt, hashAadhar } = require("../utils/encryption");
 
 const AADHAR_REGEX = /^\d{12}$/;
+const MONTH_REGEX = /^\d{4}-\d{2}$/;
 const ATTENDANCE_EDIT_WINDOW_DAYS = 30;
 
 const ok = (res, data, message = "Operation successful", code = 200) =>
@@ -251,15 +247,30 @@ async function student(req, res, next) {
 
 async function createStudent(req, res, next) {
   try {
-    const { name, rollNumber, classId, aadharNumber } = req.body || {};
+    const {
+      name,
+      rollNumber,
+      classId,
+      aadharNumber,
+      parentPhone,
+      monthlyFee,
+      feesStartMonth,
+    } = req.body || {};
     const photoFile = req.files?.photo?.[0];
+    const fee = Number(monthlyFee);
+
+    if (!Number.isFinite(fee) || fee < 0)
+      throw fail("Monthly fee must be zero or greater");
+
+    const startMonth = feesStartMonth || new Date().toISOString().slice(0, 7);
+    if (!MONTH_REGEX.test(startMonth))
+      throw fail("Fees start month must be in YYYY-MM format");
 
     if (!name || !rollNumber || !classId)
       throw fail("Name, roll number, and class ID are required");
     if (!photoFile) throw fail("Student photo is required");
     if (!AADHAR_REGEX.test(aadharNumber || ""))
       throw fail("Aadhar number must be exactly 12 digits");
-
     id(classId);
     if (!(await Class.exists({ _id: classId })))
       throw fail("Class not found", 404);
@@ -279,6 +290,7 @@ async function createStudent(req, res, next) {
       name,
       rollNumber,
       classId,
+      parentPhone,
       photo: {
         publicId: photoResult.public_id,
         resourceType: "image",
@@ -286,6 +298,8 @@ async function createStudent(req, res, next) {
       },
       aadharNumber: encrypt(aadharNumber),
       aadharHash,
+      monthlyFee: fee,
+      feesStartMonth: startMonth,
     });
 
     const obj = s.toJSON();
@@ -307,7 +321,15 @@ async function updateStudent(req, res, next) {
     if (!existing) throw fail("Student not found", 404);
 
     const photoFile = req.files?.photo?.[0];
-    const { name, rollNumber, classId, aadharNumber } = req.body || {};
+    const {
+      name,
+      rollNumber,
+      classId,
+      aadharNumber,
+      parentPhone,
+      monthlyFee,
+      feesStartMonth,
+    } = req.body || {};
 
     const update = { name, rollNumber, classId };
 
@@ -324,7 +346,6 @@ async function updateStudent(req, res, next) {
       update.aadharNumber = encrypt(aadharNumber);
       update.aadharHash = aadharHash;
     }
-
     if (photoFile) {
       const result = await uploadToCloudinary(
         photoFile.buffer,
@@ -337,6 +358,17 @@ async function updateStudent(req, res, next) {
         resourceType: "image",
         mimeType: photoFile.mimetype,
       };
+    }
+    if (monthlyFee !== undefined) {
+      const fee = Number(monthlyFee);
+      if (!Number.isFinite(fee) || fee < 0)
+        throw fail("Monthly fee must be zero or greater");
+      update.monthlyFee = fee;
+    }
+    if (feesStartMonth) {
+      if (!MONTH_REGEX.test(feesStartMonth))
+        throw fail("Fees start month must be in YYYY-MM format");
+      update.feesStartMonth = feesStartMonth;
     }
 
     const s = await Student.findByIdAndUpdate(existing._id, update, {
@@ -372,7 +404,10 @@ async function deleteStudent(req, res, next) {
   try {
     const s = await Student.findByIdAndDelete(id(req.params.id));
     if (!s) throw fail("Student not found", 404);
-    await deleteFromCloudinary(s.photo?.publicId, s.photo?.resourceType);
+    await Promise.all([
+      deleteFromCloudinary(s.photo?.publicId, s.photo?.resourceType),
+      FeeMonth.deleteMany({ studentId: s._id }),
+    ]);
     ok(res, null, "Student deleted");
   } catch (e) {
     next(e);
@@ -787,6 +822,105 @@ async function exportMonthlyAttendance(req, res, next) {
   }
 }
 
+function monthsRange(startMonth, endMonth) {
+  const [sy, sm] = startMonth.split("-").map(Number);
+  const [ey, em] = endMonth.split("-").map(Number);
+  const months = [];
+  let y = sy,
+    m = sm;
+  while (y < ey || (y === ey && m <= em)) {
+    months.push(`${y}-${String(m).padStart(2, "0")}`);
+    m += 1;
+    if (m > 12) {
+      m = 1;
+      y += 1;
+    }
+  }
+  return months;
+}
+
+function monthLabel(monthStr) {
+  const [y, m] = monthStr.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+async function feeSummaryFor(student) {
+  if (!student.feesStartMonth) {
+    return {
+      feesConfigured: false,
+      monthlyFee: 0,
+      months: [],
+      totalRemaining: 0,
+    };
+  }
+
+  const now = new Date();
+  const currentMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  const monthKeys = monthsRange(student.feesStartMonth, currentMonth);
+
+  const records = await FeeMonth.find({
+    studentId: student._id,
+    month: { $in: monthKeys },
+  });
+  const paidMap = new Map(records.map((r) => [r.month, r.paid]));
+
+  const months = monthKeys.map((month) => ({
+    month,
+    label: monthLabel(month),
+    paid: paidMap.get(month) || false,
+    isCurrent: month === currentMonth,
+  }));
+
+  // Only months that have fully ended count toward what's owed — the
+  // month in progress isn't "late" until it's over.
+  const monthlyFee = student.monthlyFee || 0;
+  const unpaidPastMonths = months.filter((m) => !m.isCurrent && !m.paid).length;
+
+  return {
+    feesConfigured: true,
+    monthlyFee,
+    feesStartMonth: student.feesStartMonth,
+    months,
+    totalRemaining: unpaidPastMonths * monthlyFee,
+  };
+}
+
+async function studentFees(req, res, next) {
+  try {
+    const s = await Student.findById(id(req.params.id));
+    if (!s) throw fail("Student not found", 404);
+    ok(res, await feeSummaryFor(s));
+  } catch (e) {
+    next(e);
+  }
+}
+
+async function setFeeMonth(req, res, next) {
+  try {
+    const s = await Student.findById(id(req.params.id));
+    if (!s) throw fail("Student not found", 404);
+
+    const month = req.params.month;
+    if (!MONTH_REGEX.test(month)) throw fail("Invalid month format");
+
+    const paid = Boolean(req.body?.paid);
+
+    await FeeMonth.findOneAndUpdate(
+      { studentId: s._id, month },
+      { paid, updatedBy: req.user._id },
+      { upsert: true, new: true, setDefaultValue: true },
+    );
+
+    ok(res, await feeSummaryFor(s), "Fee status updated");
+  } catch (e) {
+    next(e);
+  }
+}
+
 module.exports = {
   login,
   me,
@@ -814,5 +948,8 @@ module.exports = {
   updateAttendance,
   deleteAttendance,
   exportMonthlyAttendance,
+  studentFees,
+  studentFees,
+  setFeeMonth,
   dashboard,
 };
